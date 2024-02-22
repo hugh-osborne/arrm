@@ -1,0 +1,6 @@
+[submodule "vcpkg"]
+	path = vcpkg
+	url = https://github.com/microsoft/vcpkg.git
+[submodule "opensim-core"]
+	path = opensim-core
+	url = https://github.com/hugh-osborne/opensim-core.git
