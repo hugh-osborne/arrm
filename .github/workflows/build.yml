@@ -1,0 +1,152 @@
+name: Build
+on: [push]
+
+jobs: 
+  build:
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest,windows-2019] #[ubuntu-latest, windows-2019, macos-10.15]  
+    env:
+      buildDir: '${{ github.workspace }}/build'
+      # skip python 2.7 and 3.5, PyPy, and 32 bit builds
+      CIBW_BUILD: "cp310-manylinux_x86_64 cp36-win_amd64 cp37-win_amd64 cp38-win_amd64 cp39-win_amd64 cp310-win_amd64 cp311-win_amd64 cp312-win_amd64"
+      CIBW_SKIP: "pp*"
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux2014_x86_64:latest
+      CIBW_BEFORE_BUILD: pip install cmake numpy scikit-build build auditwheel
+      #CIBW_BEFORE_BUILD_WINDOWS: pip install cmake scikit-build build auditwheel numpy matplotlib scipy shapely descartes && type C:/\"Program Files (x86)\"/\"Microsoft Visual Studio\"/2019/Enterprise/VC/Tools/MSVC/14.29.30133/bin/HostX86/x64/../../../../../../../VC/Auxiliary/Build/vcvars64.bat
+      # Linux builds are on docker images so we need to add the dependency installation setup here so they go to the docker not the host. Installing cuda is *SLOW* and we have to do it on *EVERY* image argh!
+      CIBW_BEFORE_BUILD_LINUX: pwd && pip install cmake scikit-build build auditwheel && yum install -y centos-release-scl ; yum install -y wget devtoolset-7 ; yum install -y ninja-build python36-devel swig freeglut-devel gsl-devel libXi-devel mesa-libGL-devel mesa-libGLU-devel libXrandr-devel libXxf86vm-devel openblas-devel lapack-devel && cd opensim_dependencies_build && cmake ../opensim-core/dependencies -DCMAKE_INSTALL_PREFIX="../opensim_dependencies_install" -DOPENSIM_WITH_CASADI="off" -DOPENSIM_WITH_TROPTER="off" && make -j8 && pwd && cd ../opensim_build && cmake ../opensim-core -DCMAKE_INSTALL_PREFIX="../opensim_install" -DOPENSIM_DEPENDENCIES_DIR="../opensim_dependencies_install" -DBUILD_API_ONLY=ON -DBUILD_PYTHON_WRAPPING=OFF -DWITH_BTK=ON -DBUILD_API_EXAMPLES=OFF -DBUILD_TESTING=OFF -DOPENSIM_WITH_CASADI="off" -DOPENSIM_WITH_TROPTER="off" && make install -j8 && printf "/project/opensim_dependencies_install/simbody/lib64" > /etc/ld.so.conf.d/opensimdep.conf && printf "/project/opensim_install/lib64" > /etc/ld.so.conf.d/opensim.conf && ldconfig -v
+      CIBW_REPAIR_WHEEL_COMMAND_MACOS: "" # Something wrong with the cibuildwheel delocate call. We manually run it after all wheels have been built.
+      CIBW_ENVIRONMENT_MACOS: "CC=gcc-6 CXX=g++-6"
+      CIBW_ENVIRONMENT_LINUX: "CC=/opt/rh/devtoolset-7/root/usr/bin/gcc CXX=/opt/rh/devtoolset-7/root/usr/bin/g++"
+      CIBW_BUILD_VERBOSITY: 0
+    steps:
+    
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+          
+      - uses: lukka/get-cmake@latest
+      
+      # If you're having trouble with "nvcc failed to compile simple test program" make sure the below version and location is correct
+      - name: Manually add MSVC to Path
+        run: |
+          PATH=$PATH:C:/"Program Files (x86)"/"Microsoft Visual Studio"/2019/Enterprise/VC/Tools/MSVC/14.29.30133/bin/Hostx86/x64/cl.exe
+          echo $PATH
+        shell: bash
+        if: contains( matrix.os, 'windows')
+
+      - name: Install Ninja Dependency on Windows
+        run: choco install ninja swig -y
+        if: contains( matrix.os, 'windows')
+        
+      - name: Install Dependencies on MacOS
+        run: brew install gcc6 ninja
+        if: contains( matrix.os, 'macos')
+
+      - name: Restore artifacts, or setup vcpkg 
+        uses: lukka/run-vcpkg@v10
+        with:
+          # Just install vcpkg for now, do not install any ports in this step yet.
+          setupOnly: true
+          # Location of the vcpkg submodule in the Git repository.
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          # Since the cache must be invalidated when content of the vcpkg.json file changes, let's
+          # compute its hash and append this to the computed cache's key.
+          appendedCacheKey: ${{ hashFiles( '**/vcpkg.json' ) }}
+          vcpkgTriplet: x64-windows
+          # Ensure the vcpkg artifacts are cached, they are generated in the 'CMAKE_BINARY_DIR/vcpkg_installed' directory.
+          additionalCachedPaths: ${{ github.workspace }}/vcpkg_installed
+        if: contains( matrix.os, 'windows')
+        
+      - name: Set up Python
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8
+          
+      - name: Install cibuildwheel
+        run: |
+          python -m pip install cmake numpy twine cibuildwheel
+          
+      - name: Check directory structure
+        run: dir
+        if: contains( matrix.os, 'windows')
+          
+      - name: Cache OpenSim
+        id: cache-opensim
+        uses: actions/cache@v2
+        with:
+          path: |
+            ${{ github.workspace }}/opensim_install
+            ${{ github.workspace }}/opensim_dependencies_install
+            ${{ github.workspace }}/opensim_dependencies_build
+            ${{ github.workspace }}/opensim_build
+          key: ${{ runner.os }}-opensim
+
+      - name: Build opensim from source
+        if: steps.cache-opensim.outputs.cache-hit != 'true' && contains( matrix.os, 'windows')
+        run: |
+          mkdir opensim_dependencies_build
+          cd opensim_dependencies_build
+          cmake ../opensim-core/dependencies -G"Visual Studio 16 2019" -DCMAKE_INSTALL_PREFIX="../opensim_dependencies_install"
+          cmake --build . --config RelWithDebInfo -- /maxcpucount:8
+          cd ..
+          mkdir opensim_build
+          cd opensim_build
+          cmake ../opensim-core -G"Visual Studio 16 2019" -DCMAKE_INSTALL_PREFIX="../opensim_install" -DOPENSIM_DEPENDENCIES_DIR="../opensim_dependencies_install" -DBUILD_API_ONLY=ON -DBUILD_PYTHON_WRAPPING=ON -DBUILD_API_EXAMPLES=OFF -DBUILD_TESTING=OFF                                 
+          cmake --build . --config RelWithDebInfo -- /maxcpucount:8
+          cmake --build . --config RelWithDebInfo --target install -- /maxcpucount:8
+
+      - name: Free Disk Space (Ubuntu)
+        if: contains( matrix.os, 'ubuntu')
+        uses: jlumbroso/free-disk-space@main
+        with:
+        # this might remove tools that are actually needed,
+        # if set to "true" but frees about 6 GB
+          tool-cache: false
+        
+        # all of these default to true, but feel free to set to
+        # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true    
+      
+      - name: Build opensim from source Linux
+        if: steps.cache-opensim.outputs.cache-hit != 'true' && contains( matrix.os, 'ubuntu')
+        run: |
+          mkdir opensim_dependencies_build
+          mkdir opensim_build
+          
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir dist
+            
+      - uses: actions/upload-artifact@v2
+        with:
+          path: dist/*.whl 
+          
+      # Commit and push all changed files.
+      - name: GIT Commit Build Artifacts (coverage, dist, devdist, docs)
+      # Only run on main branch push (e.g. after pull request merge).
+        if: github.event_name == 'push' && contains( matrix.os, 'ubuntu')
+        run: |
+          git config --global user.name "hugh"
+          git config --global user.email "hugh.osborne+git@gmail.com"
+          git add dist/*.whl
+          git commit -a -m "update wheels"
+          git push
+
+      #- name: Publish package to test pypi
+      #  run: python -m twine upload -u __token__ -p ${{ secrets.ARMM_PYPI_TEST }} --skip-existing --repository testpypi dist/*
+      #  if: github.event_name == 'push'
+        
+      # the built linux libraries are too large to go on proper pypi. Just have to get it from testpypi
+      - name: Publish package to pypi
+        run: python -m twine upload dist/* -u __token__ -p ${{ secrets.ARMM_PYPI }}
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags') && contains( matrix.os, 'windows')
+        
